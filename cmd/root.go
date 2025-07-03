@@ -17,7 +17,6 @@ var rootCmd = &cobra.Command{
 	Short: "A tool to export the state of ethereum nodes",
 	Run: func(cmd *cobra.Command, args []string) {
 		initCommon()
-
 		err := export.Serve(cmd.Context(), metricsPort)
 		if err != nil {
 			logr.Fatal(err)
@@ -37,6 +36,9 @@ var (
 	monitoredDirectories []string
 	executionModules     []string
 	diskUsageInterval    string
+	// Zilliqa flags
+	zilliqaRPCURL      string
+	zilliqaCheckInterval string
 )
 
 const (
@@ -60,7 +62,9 @@ func init() {
 	rootCmd.PersistentFlags().StringSliceVarP(&monitoredDirectories, "monitored-directories", "", []string{}, "(optional) directories to monitor for disk usage")
 	rootCmd.PersistentFlags().StringSliceVarP(&executionModules, "execution-modules", "", []string{}, "(optional) execution modules that are enabled on the node")
 	rootCmd.PersistentFlags().StringVar(&diskUsageInterval, "disk-usage-interval", "", "(optional) interval for disk usage metrics collection (e.g. 1h, 5m, 30s)")
-
+	// Zilliqa flags
+	rootCmd.PersistentFlags().StringVar(&zilliqaRPCURL, "zilliqa-rpc-url", "", "(optional) URL to the Zilliqa RPC node")
+	rootCmd.PersistentFlags().StringVar(&zilliqaCheckInterval, "zilliqa-check-interval", "10s", "(optional) interval for Zilliqa metrics collection")
 	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 }
 
@@ -85,6 +89,7 @@ func loadConfigFromFile(file string) (*exporter.Config, error) {
 
 func initCommon() {
 	ctx = context.Background()
+
 	log := logrus.New()
 	log.SetFormatter(&logrus.JSONFormatter{})
 	logr = log
@@ -124,7 +129,22 @@ func initCommon() {
 		config.DiskUsage.Enabled = true
 	}
 
+	// Zilliqa configuration
+	if zilliqaRPCURL != "" {
+		config.Zilliqa.Enabled = true
+		config.Zilliqa.RPCURL = zilliqaRPCURL
+	}
+
+	if zilliqaCheckInterval != "" {
+		duration, err := time.ParseDuration(zilliqaCheckInterval)
+		if err != nil {
+			logr.WithError(err).Fatalf("Invalid Zilliqa check interval format: %s", zilliqaCheckInterval)
+		}
+		config.Zilliqa.CheckInterval = duration
+	}
+
 	export = exporter.NewExporter(log, config)
+
 	if err := export.Init(ctx); err != nil {
 		logrus.Fatal(err)
 	}
