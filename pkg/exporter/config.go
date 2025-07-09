@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/ethpandaops/beacon/pkg/human"
+	"github.com/ethereum/go-ethereum/common"
 )
 
 // Config holds the configuration for the ethereum sync status tool.
@@ -16,6 +17,8 @@ type Config struct {
 	DiskUsage DiskUsage `yaml:"diskUsage"`
 	// Pair determines if the pair metrics should be exported.
 	Pair PairConfig `yaml:"pair"`
+	// Zilliqa determines if the Zilliqa metrics should be exported.
+	Zilliqa ZilliqaConfig `yaml:"zilliqa"`
 }
 
 // ConsensusNode represents a single ethereum consensus client.
@@ -51,10 +54,17 @@ type PairConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// ZilliqaConfig represents Zilliqa configuration
+type ZilliqaConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	RPCURL          string        `yaml:"rpcUrl"`
+	DepositContract string        `yaml:"depositContract"`
+	CheckInterval   time.Duration `yaml:"checkInterval"`
+}
+
 // DefaultConfig represents a sane-default configuration.
 func DefaultConfig() *Config {
 	f := false
-
 	return &Config{
 		Execution: ExecutionNode{
 			Enabled: true,
@@ -81,5 +91,43 @@ func DefaultConfig() *Config {
 		Pair: PairConfig{
 			Enabled: true,
 		},
+		Zilliqa: ZilliqaConfig{
+			Enabled:         false,
+			RPCURL:          "",
+			DepositContract: "0x00000000005a494c4445504f53495450524f5859",
+			CheckInterval:   10 * time.Second,
+		},
 	}
+}
+
+// GetZilliqaDepositContract returns the deposit contract address
+func (c *Config) GetZilliqaDepositContract() common.Address {
+	if c.Zilliqa.DepositContract != "" {
+		return common.HexToAddress(c.Zilliqa.DepositContract)
+	}
+	// Return default contract address
+	return common.HexToAddress("0x00000000005a494c4445504f53495450524f5859")
+}
+
+// IsAnyEnabled returns true if any exporter is enabled
+func (c *Config) IsAnyEnabled() bool {
+	return c.Execution.Enabled || c.Consensus.Enabled || c.Zilliqa.Enabled || c.DiskUsage.Enabled
+}
+
+// EnabledExporters returns a list of enabled exporters
+func (c *Config) EnabledExporters() []string {
+	var enabled []string
+	if c.Execution.Enabled {
+		enabled = append(enabled, "execution")
+	}
+	if c.Consensus.Enabled {
+		enabled = append(enabled, "consensus")
+	}
+	if c.Zilliqa.Enabled {
+		enabled = append(enabled, "zilliqa")
+	}
+	if c.DiskUsage.Enabled {
+		enabled = append(enabled, "diskUsage")
+	}
+	return enabled
 }

@@ -10,6 +10,8 @@ import (
 	"github.com/ethpandaops/beacon/pkg/beacon"
 	"github.com/ethpandaops/ethereum-metrics-exporter/pkg/exporter/disk"
 	"github.com/ethpandaops/ethereum-metrics-exporter/pkg/exporter/execution"
+	"github.com/ethpandaops/ethereum-metrics-exporter/pkg/exporter/zilliqa"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 )
@@ -42,6 +44,7 @@ type exporter struct {
 	// Exporters
 	execution execution.Node
 	diskUsage disk.UsageMetrics
+	zilliqa   *zilliqa.Metrics
 
 	// Clients
 	beacon beacon.Node
@@ -94,6 +97,25 @@ func (e *exporter) Init(ctx context.Context) error {
 		e.diskUsage = diskUsage
 	}
 
+	// Initialize Zilliqa exporter
+	if e.config.Zilliqa.Enabled {
+		e.log.Info("Initializing Zilliqa...")
+
+		zilliqaConfig := &zilliqa.Config{
+			Enabled:         e.config.Zilliqa.Enabled,
+			RPCURL:          e.config.Zilliqa.RPCURL,
+			DepositContract: e.config.GetZilliqaDepositContract(),
+			CheckInterval:   e.config.Zilliqa.CheckInterval,
+		}
+
+		zilliqaExporter, err := zilliqa.NewFromConfig(zilliqaConfig, e.log.WithField("exporter", "zilliqa"))
+		if err != nil {
+			return err
+		}
+
+		e.zilliqa = zilliqaExporter
+	}
+
 	return nil
 }
 
@@ -105,6 +127,7 @@ func (e *exporter) Serve(ctx context.Context, port int) error {
 	e.log.
 		WithField("consensus_url", e.config.Consensus.URL).
 		WithField("execution_url", e.config.Execution.URL).
+		WithField("zilliqa_url", e.config.Zilliqa.RPCURL).
 		Info(fmt.Sprintf("Starting metrics server on :%v", port))
 
 	s := &http.Server{
@@ -112,7 +135,22 @@ func (e *exporter) Serve(ctx context.Context, port int) error {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	http.Handle("/metrics", promhttp.Handler())
+	// Register Zilliqa metrics - this is the missing piece!
+	if e.config.Zilliqa.Enabled {
+		e.log.Info("Registering Zilliqa metrics with Prometheus")
+		// Create a new registry for Zilliqa metrics
+		zilliqaRegistry := prometheus.NewRegistry()
+		e.zilliqa.Register(zilliqaRegistry)
+		
+		// Merge with existing metrics by using a custom handler
+		http.Handle("/metrics", promhttp.HandlerFor(
+			prometheus.Gatherers{prometheus.DefaultGatherer, zilliqaRegistry},
+			promhttp.HandlerOpts{},
+		))
+	} else {
+		// Use default registry if Zilliqa is disabled
+		http.Handle("/metrics", promhttp.Handler())
+	}
 
 	go func() {
 		err := s.ListenAndServe()
@@ -143,6 +181,13 @@ func (e *exporter) Serve(ctx context.Context, port int) error {
 		}
 
 		go e.beacon.StartAsync(ctx)
+	}
+
+	// Start Zilliqa metrics collection
+	if e.config.Zilliqa.Enabled {
+		e.log.WithField("zilliqa_url", e.config.Zilliqa.RPCURL).Info("Starting Zilliqa metrics...")
+
+		go e.zilliqa.Start(ctx)
 	}
 
 	return nil
