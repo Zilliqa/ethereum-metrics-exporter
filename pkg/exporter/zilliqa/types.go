@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/ethpandaops/beacon/pkg/human"
 	"github.com/ethereum/go-ethereum/common"
 )
 
@@ -12,20 +13,22 @@ type Config struct {
 	Enabled             bool              `yaml:"enabled"`
 	RPCURL              string            `yaml:"rpcUrl"`
 	DepositContract     common.Address    `yaml:"depositContract"`
-	CheckInterval       time.Duration     `yaml:"checkInterval"`
+	Interval            human.Duration    `yaml:"interval"`
 }
 
 // State holds the current processing state
 type State struct {
-	LastProcessedBlock uint64 `json:"lastProcessedBlock"`
-	LastProcessedView  uint64 `json:"lastProcessedView"`
+	CurrentFinalizedBlock uint64            `json:"currentFinalizedBlock"`
+	CurrentFinalizedView  uint64            `json:"currentFinalizedView"`
+	Views                 []*ConsensusView  `json:"views"`
 }
 
 // NewState creates a new state instance
 func NewState() *State {
 	return &State{
-		LastProcessedBlock: 0,
-		LastProcessedView:  0,
+		CurrentFinalizedBlock: 0,
+		CurrentFinalizedView: 0,
+		Views: make([]*ConsensusView, 0),
 	}
 }
 
@@ -99,7 +102,7 @@ func DefaultConfig() *Config {
 		Enabled:             false,
 		RPCURL:              "",
 		DepositContract:     common.HexToAddress("0x00000000005a494c4445504f53495450524f5859"),
-		CheckInterval:       10 * time.Second,
+		Interval:            human.Duration{Duration: 10 * time.Second},
 	}
 }
 

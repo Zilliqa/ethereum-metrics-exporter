@@ -22,7 +22,8 @@ type Metrics struct {
 	log         logrus.FieldLogger
 	config      *Config
 	state       *State
-	
+	debug       bool
+
 	// Prometheus metrics
 	proposedViews        *prometheus.CounterVec
 	cosignedViews        *prometheus.CounterVec
@@ -31,13 +32,21 @@ type Metrics struct {
 }
 
 // NewMetrics creates a new Zilliqa metrics collector
-func NewMetrics(client *ethclient.Client, log logrus.FieldLogger, config *Config) *Metrics {
+func NewMetrics(client *ethclient.Client, log logrus.FieldLogger, config *Config, debug bool) *Metrics {
+
+	// If debug is enabled, ensure the logger shows debug messages
+	logger := log.WithField("component", "zilliqa_metrics")
+	if debug {
+		logger.Logger.SetLevel(logrus.DebugLevel)
+	}
+	
 	return &Metrics{
 		client: client,
-		log:    log.WithField("component", "zilliqa_metrics"),
+		log:    logger,
 		config: config,
 		state:  NewState(),
-		
+		debug:  debug,
+
 		proposedViews: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "zilliqa_proposed_views_total",
@@ -79,10 +88,14 @@ func (m *Metrics) Register(registry *prometheus.Registry) {
 
 // Start begins the metrics collection loop
 func (m *Metrics) Start(ctx context.Context) {
-	ticker := time.NewTicker(m.config.CheckInterval)
+	ticker := time.NewTicker(m.config.Interval.Duration)
 	defer ticker.Stop()
 	
-	m.log.Info("Starting Zilliqa metrics collection")
+	m.log.WithFields(logrus.Fields{
+    "check_interval": m.config.Interval.Duration,
+    "debug": m.debug,
+    "action": "start_metrics_collection",
+	}).Info("Starting Zilliqa metrics collector")
 	
 	for {
 		select {
@@ -99,50 +112,95 @@ func (m *Metrics) Start(ctx context.Context) {
 
 // update processes new blocks and updates metrics
 func (m *Metrics) update(ctx context.Context) error {
-	latestBlock, err := m.client.BlockByNumber(ctx, nil)
+	// Create the consensus view for the finalized block
+	consensusView, err := m.createConsensusView(ctx, big.NewInt(-3))
 	if err != nil {
-		return fmt.Errorf("failed to get latest block: %w", err)
+		return fmt.Errorf("failed to create consensus view: %w", err)
 	}
-	
-	// Initialize state on first run
-	if m.state.LastProcessedBlock == 0 {
-		m.state.LastProcessedBlock = latestBlock.NumberU64()
-		m.state.LastProcessedView = latestBlock.NumberU64()
-		m.log.WithField("block", latestBlock.NumberU64()).Info("Initialized processing state")
+
+	// Initialize state on the first run
+	if m.state.CurrentFinalizedBlock == 0 {
+		m.state.CurrentFinalizedBlock = consensusView.BlockNumber
+		m.state.CurrentFinalizedView = consensusView.View
+		m.log.WithFields(logrus.Fields{
+			"finalized_block": m.state.CurrentFinalizedBlock,
+			"finalized_view": m.state.CurrentFinalizedView,
+			"action": "set_initial_finalized_state",
+		}).Info("Set initial finalized state")
+	}
+
+	// Nothing to do if the finalized block has not moved
+	if m.state.CurrentFinalizedBlock == consensusView.BlockNumber {
 		return nil
 	}
-	
-	// Nothing to do if latest block hasn't moved
-	if m.state.LastProcessedBlock >= latestBlock.NumberU64() {
-		return nil
-	}
-	
+	m.log.Debugf("Processing blocks between %d and %d", m.state.CurrentFinalizedBlock+1, consensusView.BlockNumber)
+
 	// Process blocks from last processed to current latest
-	for blockNum := m.state.LastProcessedBlock + 1; blockNum <= latestBlock.NumberU64(); blockNum++ {
-		if err := m.processBlock(ctx, blockNum); err != nil {
-			m.log.WithError(err).WithField("block", blockNum).Warn("Failed to process block")
-			continue
+	for {
+		// Get the next consensus view
+		nextConsensusView, err := m.createConsensusView(ctx, big.NewInt(int64(m.state.CurrentFinalizedBlock + 1)))
+		if err != nil {
+			return fmt.Errorf("failed to create consensus view: %w", err)
 		}
-		
-		// Log progress every 10 blocks
-		if blockNum%10 == 0 {
-			m.log.WithFields(logrus.Fields{
-				"block": blockNum,
-				"latest": latestBlock.NumberU64(),
-				"remaining": latestBlock.NumberU64() - blockNum,
-			}).Info("Processing blocks")
+
+		// Get the missed views
+		m.log.WithFields(logrus.Fields{
+				"current_finalized_view": m.state.CurrentFinalizedView,
+				"start_view":            	m.state.CurrentFinalizedView + 1,
+				"end_view":              	nextConsensusView.View,
+				"loop_condition":        	m.state.CurrentFinalizedView + 1 < nextConsensusView.View,
+				"action":               	"start_missed_views_processing",
+		}).Debug("Start missed views processing")
+		for view := m.state.CurrentFinalizedView + 1; view < nextConsensusView.View; view++ {
+				missedView, err := m.createMissedView(ctx, big.NewInt(int64(m.state.CurrentFinalizedBlock)), view)
+				if err != nil {
+						return err
+				}
+				m.state.Views = append(m.state.Views, missedView)
+				m.log.WithFields(logrus.Fields{
+					"view_index": 		view,
+					"processed_view": missedView.View,
+					"action":         "missed_view_processed",
+				}).Debug("Processed missed view")
+		}
+		nextView := nextConsensusView.View
+		m.state.Views = append(m.state.Views, nextConsensusView)
+		m.state.CurrentFinalizedBlock += 1
+		m.state.CurrentFinalizedView = nextView
+		if consensusView.View == nextView {
+			break
+		}
+
+		// Set the finalized block number in metrics
+		m.finalizedBlockNumber.WithLabelValues().Set(float64(m.state.CurrentFinalizedBlock))
+	}
+
+	for len(m.state.Views) > 0 {
+		view := m.state.Views[0]
+		m.state.Views = m.state.Views[1:]
+		if err := m.processView(ctx, view); err != nil {
+			m.log.WithError(err).WithField("view", view).Error("Failed to process view")
+			return fmt.Errorf("failed to process consensus view: %w", err)
 		}
 	}
-	
-	// Update state and metrics
-	m.state.LastProcessedBlock = latestBlock.NumberU64()
-	m.finalizedBlockNumber.WithLabelValues().Set(float64(latestBlock.NumberU64()))
-	
+
 	return nil
 }
 
-// processBlock processes a single block for metrics
-func (m *Metrics) processBlock(ctx context.Context, blockNum uint64) error {
+// Get the consensus view parameters
+func (m *Metrics) createConsensusView(ctx context.Context, blockNumberOrTag *big.Int) (*ConsensusView, error) {
+	// Get block header only (no transactions)
+	header, err := m.client.HeaderByNumber(ctx, blockNumberOrTag)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block header: %w", err)
+	}
+	blockNum := header.Number.Uint64()
+
+	m.log.WithFields(logrus.Fields{
+		"finalized_block": blockNum,
+		"action": "get_finalized_block",
+	}).Debug("Finalized block info")
+
 	// Get Zilliqa fields from block
 	viewNum, cosigned, err := m.getZilliqaFields(ctx, blockNum)
 	if err != nil {
@@ -150,24 +208,24 @@ func (m *Metrics) processBlock(ctx context.Context, blockNum uint64) error {
 		cosigned = []byte{}
 	}
 	
-	// Get stakers and leader
-	stakers, err := m.getStakers(ctx, blockNum)
+	// Get leader from view and block
+	leader, err := m.getLeader(ctx, viewNum, blockNum-1)
 	if err != nil {
-		return fmt.Errorf("failed to get stakers: %w", err)
-	}
-	
-	leader, err := m.getLeader(ctx, viewNum, blockNum)
-	if err != nil {
-		m.log.WithError(err).WithField("view", viewNum).Debug("Could not get leader from contract")
+		m.log.WithError(err).WithField("view", viewNum).Error("Could not get leader from contract")
 		leader = []byte("no-leader")
 	}
-	
-	// Create validators with cosigning data
+
+	// Get stakers from previous block
+	stakers, err := m.getStakers(ctx, blockNum-1)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to get stakers: %w", err)
+	}
+
+	// Create validators from cosigned data and stakers
 	validators := make([]Validator, len(stakers))
+	cosignedCount := 0
 	for i, staker := range stakers {
-		balance, validatorIndex, _ := m.getStakerData(ctx, staker, blockNum)
-		
-		// Calculate cosigned status
+		balance, validatorIndex, controlAddr, rewardAddr, peerID, _ := m.getStakerData(ctx, staker, blockNum)
 		cosignedStatus := false
 		if len(cosigned) > 0 && validatorIndex > 0 {
 			adjustedIndex := validatorIndex - 1
@@ -179,15 +237,38 @@ func (m *Metrics) processBlock(ctx context.Context, blockNum uint64) error {
 				}
 			}
 		}
-		
+    if cosignedStatus {
+        cosignedCount++
+    }
 		validators[i] = Validator{
-			BlsPubKey: staker,
-			Balance:   balance,
-			Cosigned:  cosignedStatus,
+			BlsPubKey:   staker,
+			ControlAddr: controlAddr,
+			RewardAddr:  rewardAddr,
+			Balance:     balance,
+			PeerID:      peerID,
+			Cosigned:    cosignedStatus,
 		}
 	}
-	
-	// Process view for metrics
+	validatorsList := make([]map[string]interface{}, len(validators))
+	for i, validator := range validators {
+			validatorsList[i] = map[string]interface{}{
+					"bls_pub_key": fmt.Sprintf("0x%x", validator.BlsPubKey),
+					"control_address": validator.ControlAddr.Hex(),
+					"reward_address":  validator.RewardAddr.Hex(), 
+					"balance":         validator.Balance.String(),
+					"peer_id":         fmt.Sprintf("0x%x", validator.PeerID),
+					"cosigned":    		 validator.Cosigned,
+			}
+	}
+	m.log.WithFields(logrus.Fields{
+			"block_num": blockNum,
+			"validators_count": len(validators),
+			"cosigned_count": cosignedCount,
+			"cosigned_percentage": float64(cosignedCount)/float64(len(validators))*100,
+			"action": "create_validators",
+	}).Debug("Successfully created validators")
+
+	// Process consensus view
 	consensusView := &ConsensusView{
 		View:        viewNum,
 		BlockNumber: blockNum,
@@ -195,26 +276,86 @@ func (m *Metrics) processBlock(ctx context.Context, blockNum uint64) error {
 		Leader:      leader,
 		Validators:  validators,
 	}
-	
-	// Debug the consensus view
+	m.log.WithFields(logrus.Fields{
+		"consensus_view": consensusView.View,
+		"block_number":   consensusView.BlockNumber,
+		"mined":          consensusView.Mined,
+		"leader":         fmt.Sprintf("0x%x", consensusView.Leader),
+		"validators":     len(consensusView.Validators),
+		"action":         "create_consensus_view",
+	}).Debug("Consensus view data")
+
+	return consensusView, nil
+}
+
+// Get the missed view parameters
+func (m *Metrics) createMissedView(ctx context.Context, blockNumberOrTag *big.Int, viewNum uint64) (*ConsensusView, error) {
+	// Get leader from view and block
+	blockNum := blockNumberOrTag.Uint64()
+	leader, err := m.getLeader(ctx, viewNum, blockNum)
+	if err != nil {
+		m.log.WithError(err).WithField("view", viewNum).Error("Could not get leader from contract")
+		leader = []byte("no-leader")
+	}
+
+	// Get stakers from previous block
+	stakers, err := m.getStakers(ctx, blockNum)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to get stakers: %w", err)
+	}
+
+	// Create validators from cosigned data and stakers
+	validators := make([]Validator, len(stakers))
 	cosignedCount := 0
-	for _, v := range validators {
-		if v.Cosigned {
-			cosignedCount++
+	for i, staker := range stakers {
+		balance, _, controlAddr, rewardAddr, peerID, _ := m.getStakerData(ctx, staker, blockNum)
+		validators[i] = Validator{
+			BlsPubKey:   staker,
+			ControlAddr: controlAddr,
+			RewardAddr:  rewardAddr,
+			Balance:     balance,
+			PeerID:      peerID,
+			Cosigned:    false,
 		}
 	}
-	
+	validatorsList := make([]map[string]interface{}, len(validators))
+	for i, validator := range validators {
+			validatorsList[i] = map[string]interface{}{
+					"bls_pub_key": fmt.Sprintf("0x%x", validator.BlsPubKey),
+					"control_address": validator.ControlAddr.Hex(),
+					"reward_address":  validator.RewardAddr.Hex(), 
+					"balance":         validator.Balance.String(),
+					"peer_id":         fmt.Sprintf("0x%x", validator.PeerID),
+					"cosigned":    		 validator.Cosigned,
+			}
+	}
 	m.log.WithFields(logrus.Fields{
-		"block": blockNum,
-		"view": viewNum,
-		"view_equals_block": viewNum == blockNum,
-		"leader_preview": fmt.Sprintf("0x%x", leader[:min(len(leader), 16)]),
-		"leader_string": string(leader),
-		"validator_count": len(validators),
-		"cosigned_count": cosignedCount,
-	}).Debug("Processing consensus view")
-	
-	return m.processView(ctx, consensusView)
+			"block_num": blockNum,
+			"validators_count": len(validators),
+			"cosigned_count": cosignedCount,
+			"cosigned_percentage": float64(cosignedCount)/float64(len(validators))*100,
+			"validators": validatorsList,
+			"action": "create_validators",
+	}).Debug("Successfully created validators")
+
+	// Process consensus view
+	consensusView := &ConsensusView{
+		View:        viewNum,
+		BlockNumber: blockNum,
+		Mined:       false,
+		Leader:      leader,
+		Validators:  validators,
+	}
+	m.log.WithFields(logrus.Fields{
+		"consensus_view": consensusView.View,
+		"block_number":   consensusView.BlockNumber,
+		"mined":          consensusView.Mined,
+		"leader":         fmt.Sprintf("0x%x", consensusView.Leader),
+		"validators":     len(consensusView.Validators),
+		"action":         "create_missed_view",
+	}).Debug("Missed view data")
+
+	return consensusView, nil
 }
 
 // getZilliqaFields extracts Zilliqa-specific fields from block
@@ -226,7 +367,7 @@ func (m *Metrics) getZilliqaFields(ctx context.Context, blockNum uint64) (uint64
 	if err != nil {
 		return blockNum, []byte{}, err
 	}
-	
+
 	// Extract view
 	var view uint64 = blockNum
 	if viewRaw, exists := result["view"]; exists {
@@ -249,6 +390,14 @@ func (m *Metrics) getZilliqaFields(ctx context.Context, blockNum uint64) (uint64
 		}
 	}
 	
+	m.log.WithFields(logrus.Fields{
+		"block_num": blockNum,
+		"view_num": view,
+		"cosigned_hex": fmt.Sprintf("%x", cosigned),
+		"cosigned_len": len(cosigned),
+		"action": "get_zilliqa_fields",
+	}).Debug("Successfully retrieved Zilliqa fields")
+
 	return view, cosigned, nil
 }
 
@@ -261,12 +410,23 @@ func (m *Metrics) getStakers(ctx context.Context, blockNum uint64) ([][]byte, er
 		Data: common.FromHex(selector),
 	}
 	
-	result, err := m.client.CallContract(ctx, msg, big.NewInt(int64(blockNum-1)))
+	result, err := m.client.CallContract(ctx, msg, big.NewInt(int64(blockNum)))
 	if err != nil {
 		return nil, err
 	}
+
+	stakers, err := m.parseStakersResponse(result)
+	if err != nil {
+		return nil, err
+	}
+
+	m.log.WithFields(logrus.Fields{
+			"block_num": blockNum,
+			"stakers_count": len(stakers),
+			"action": "get_stakers",
+	}).Debug("Successfully retrieved stakers")
 	
-	return m.parseStakersResponse(result)
+	return stakers, nil
 }
 
 // getStakersAtBlock gets stakers at a specific block (helper for leader fallback)
@@ -287,17 +447,17 @@ func (m *Metrics) getStakersAtBlock(ctx context.Context, blockNum uint64) ([][]b
 }
 
 // getStakerData gets individual staker data from contract
-func (m *Metrics) getStakerData(ctx context.Context, stakerKey []byte, blockNum uint64) (*big.Int, uint64, error) {
-	abiJSON := `[{"inputs":[{"type":"bytes","name":"blsPubKey"}],"name":"getStakerData","outputs":[{"type":"uint256","name":"index"},{"type":"uint256","name":"balance"},{"type":"tuple","name":"staker","components":[{"type":"address","name":"controlAddress"},{"type":"address","name":"rewardAddress"},{"type":"bytes","name":"peerId"}]}],"stateMutability":"view","type":"function"}]`
+func (m *Metrics) getStakerData(ctx context.Context, stakerKey []byte, blockNum uint64) (*big.Int, uint64, common.Address, common.Address, []byte, error) {
+	abiJSON := `[{"inputs":[{"type":"bytes","name":"blsPubKey"}],"name":"getStakerData","outputs":[{"type":"uint256","name":"index"},{"type":"uint256","name":"balance"},{"type":"tuple","name":"staker","components":[{"type":"address","name":"controlAddress"},{"type":"address","name":"rewardAddress"},{"type":"bytes","name":"peerID"}]}],"stateMutability":"view","type":"function"}]`
 	
 	parsedABI, err := abi.JSON(strings.NewReader(abiJSON))
 	if err != nil {
-		return big.NewInt(0), 0, err
+		return big.NewInt(0), 0, common.Address{}, common.Address{}, nil, err
 	}
 	
 	callData, err := parsedABI.Pack("getStakerData", stakerKey)
 	if err != nil {
-		return big.NewInt(0), 0, err
+		return big.NewInt(0), 0, common.Address{}, common.Address{}, nil, err
 	}
 	
 	msg := ethereum.CallMsg{
@@ -307,78 +467,62 @@ func (m *Metrics) getStakerData(ctx context.Context, stakerKey []byte, blockNum 
 	
 	result, err := m.client.CallContract(ctx, msg, big.NewInt(int64(blockNum-1)))
 	if err != nil {
-		return big.NewInt(0), 0, err
+		return big.NewInt(0), 0, common.Address{}, common.Address{}, nil, err
 	}
 	
 	// Parse result manually
 	if len(result) >= 64 {
 		index := new(big.Int).SetBytes(result[0:32])
 		balance := new(big.Int).SetBytes(result[32:64])
-		return balance, index.Uint64(), nil
+		var controlAddr, rewardAddr common.Address
+		var peerID []byte
+		
+		if len(result) >= 160 {
+			controlAddr = common.BytesToAddress(result[96:128])
+			rewardAddr = common.BytesToAddress(result[128:160])
+		}
+		
+		if len(result) > 160 {
+			peerID = result[160:]
+		}
+		
+		return balance, index.Uint64(), controlAddr, rewardAddr, peerID, nil
 	}
 	
-	return big.NewInt(0), 0, nil
+	return big.NewInt(0), 0, common.Address{}, common.Address{}, nil, nil
 }
 
 // getLeader gets leader for a specific view
-func (m *Metrics) getLeader(ctx context.Context, view uint64, blockNum uint64) ([]byte, error) {
-	// First try to get leader from contract
-	leader := m.tryLeaderAtView(ctx, view, blockNum)
-	
+func (m *Metrics) getLeader(ctx context.Context, viewNum uint64, blockNum uint64) ([]byte, error) {
+	leader := m.tryLeaderAtView(ctx, viewNum, blockNum)
+	m.log.WithFields(logrus.Fields{
+		"view_num": viewNum,
+		"block_num": blockNum,
+		"view_equals_block": viewNum == blockNum,
+		"leader_hex": fmt.Sprintf("0x%x", leader),
+		"leader_len": len(leader),
+		"action": "get_leader",
+	}).Debug("Successfully retrieved leader from contract")
+
 	// If we got a valid leader (not "no-leader"), return it
 	if len(leader) > 0 && string(leader) != "no-leader" {
 		return leader, nil
-	}
-	
-	// If view equals block number, try different view numbers
-	if view == blockNum {
-		for _, tryView := range []uint64{blockNum - 1, blockNum, blockNum + 1} {
-			leader = m.tryLeaderAtView(ctx, tryView, blockNum)
-			if len(leader) > 0 && string(leader) != "no-leader" {
-				m.log.WithFields(logrus.Fields{
-					"original_view": view,
-					"working_view": tryView,
-					"leader_length": len(leader),
-				}).Debug("Found leader with adjusted view")
-				return leader, nil
-			}
-		}
-	}
-	
-	// If we still don't have a leader, use rotating leader fallback
-	stakers, err := m.getStakersAtBlock(ctx, blockNum-1)
-	if err == nil && len(stakers) > 1 {
-		// Skip index 0 (metadata), rotate through validators 1 to len(stakers)-1
-		realValidators := stakers[1:] // Skip metadata at index 0
-		if len(realValidators) > 0 {
-			leaderIndex := (view - 1) % uint64(len(realValidators)) // Rotate based on view
-			selectedLeader := realValidators[leaderIndex]
-			
-			m.log.WithFields(logrus.Fields{
-				"fallback": "rotating_leader",
-				"view": view,
-				"leader_index": leaderIndex,
-				"total_real_validators": len(realValidators),
-				"leader_preview": fmt.Sprintf("0x%x", selectedLeader[:min(len(selectedLeader), 16)]),
-			}).Debug("Using rotating validator as leader fallback")
-			return selectedLeader, nil
-		}
 	}
 	
 	return []byte("no-leader"), fmt.Errorf("no leader found and no fallback available")
 }
 
 // tryLeaderAtView attempts to get leader at specific view
-func (m *Metrics) tryLeaderAtView(ctx context.Context, view uint64, blockNum uint64) []byte {
-	selector := "0x2d1a32b2" // leaderAtView(uint256)
-	viewHex := fmt.Sprintf("%064x", view)
+func (m *Metrics) tryLeaderAtView(ctx context.Context, viewNum uint64, blockNum uint64) []byte {
+	selector := "0x75afde07" // leaderAtView(uint256)
+	viewHex := fmt.Sprintf("%064x", viewNum)
 	
 	msg := ethereum.CallMsg{
 		To:   &m.config.DepositContract,
 		Data: common.FromHex(selector + viewHex),
 	}
 	
-	result, err := m.client.CallContract(ctx, msg, big.NewInt(int64(blockNum-1)))
+	result, err := m.client.CallContract(ctx, msg, big.NewInt(int64(blockNum)))
 	if err != nil {
 		return []byte("no-leader")
 	}
@@ -396,27 +540,45 @@ func (m *Metrics) tryLeaderAtView(ctx context.Context, view uint64, blockNum uin
 }
 
 // parseStakersResponse parses the response from getStakers contract call
+// This version handles the non-standard format by looking for BLS key patterns
 func (m *Metrics) parseStakersResponse(result []byte) ([][]byte, error) {
-	if len(result) < 64 {
-		return [][]byte{}, nil
-	}
+	// Convert to hex string for easier pattern matching
+	hexStr := fmt.Sprintf("%x", result)
 	
-	arrayOffset := new(big.Int).SetBytes(result[0:32]).Uint64()
-	arrayLength := new(big.Int).SetBytes(result[arrayOffset:arrayOffset+32]).Uint64()
+	// Look for the BLS keys directly - they appear after length prefixes of 0x30 (48 bytes)
+	var stakers [][]byte
 	
-	stakers := make([][]byte, 0, arrayLength)
-	offsetTableStart := arrayOffset + 32
+	// BLS keys are 48 bytes (96 hex chars) and appear after "0000000000000000000000000000000000000000000000000000000000000030"
+	lengthPrefix := "0000000000000000000000000000000000000000000000000000000000000030"
 	
-	for i := uint64(0); i < arrayLength; i++ {
-		elementOffsetPos := offsetTableStart + (i * 32)
-		elementOffset := new(big.Int).SetBytes(result[elementOffsetPos:elementOffsetPos+32]).Uint64()
-		
-		if elementOffset+48 <= uint64(len(result)) {
-			blsKey := make([]byte, 48)
-			copy(blsKey, result[elementOffset:elementOffset+48])
-			stakers = append(stakers, blsKey)
+	pos := 0
+	for {
+		// Find the next length prefix
+		idx := strings.Index(hexStr[pos:], lengthPrefix)
+		if idx == -1 {
+			break
 		}
+		
+		// Move to the position after the length prefix
+		keyStart := pos + idx + len(lengthPrefix)
+		
+		// Extract the 48-byte BLS key (96 hex characters)
+		if keyStart+96 <= len(hexStr) {
+			blsKeyHex := hexStr[keyStart : keyStart+96]
+			blsKey := common.FromHex("0x" + blsKeyHex)
+			if len(blsKey) == 48 {
+				stakers = append(stakers, blsKey)
+			}
+		}
+		
+		// Move past this key for the next search
+		pos = keyStart + 96
 	}
+	
+	m.log.WithFields(logrus.Fields{
+		"total_response_bytes": len(result),
+		"found_stakers": len(stakers),
+	}).Debug("Parsed stakers response")
 	
 	return stakers, nil
 }
@@ -440,40 +602,40 @@ func (m *Metrics) parseLeaderResponse(result []byte) ([]byte, error) {
 	return result[offset+32:offset+32+length], nil
 }
 
-// processView processes a consensus view and updates metrics
+// Processes a consensus or missed view and updates metrics
 func (m *Metrics) processView(ctx context.Context, viewData *ConsensusView) error {
-	// Process missed views
-	for missedView := m.state.LastProcessedView + 1; missedView < viewData.View; missedView++ {
-		m.proposedViews.WithLabelValues("no-leader", "missed_next_missed").Inc()
+	var status string
+	if viewData.Mined {
+    status = "proposed"
+	} else if len(m.state.Views) > 0 && m.state.Views[0].Mined {
+		status = "missed_next_proposed"
+	} else {
+		status = "missed_next_missed"
 	}
-	
-	// Find leader identity
-	leaderIdentity := m.findLeaderIdentity(viewData.Leader, viewData.Validators)
-	
-	// Record proposed view
-	m.proposedViews.WithLabelValues(leaderIdentity, "proposed").Inc()
-	
-	// Debug what we recorded
+
+	// Set the proposed views in metrics
+	m.proposedViews.WithLabelValues(fmt.Sprintf("0x%x", viewData.Leader), status).Inc()
 	m.log.WithFields(logrus.Fields{
 		"view": viewData.View,
-		"leader_identity": leaderIdentity,
-		"validator_count": len(viewData.Validators),
-	}).Debug("Recorded proposed view with leader identity")
+		"leader": fmt.Sprintf("0x%x", viewData.Leader),
+		"proposed_status": status,
+		"action": "record_proposed_view",
+	}).Debug("Recorded proposed view with leader")
 	
 	// Process validators
-	cosignedCount := 0
 	for _, validator := range viewData.Validators {
+		// Set the cosigned views in metrics
 		identity := fmt.Sprintf("0x%x", validator.BlsPubKey)
-		
-		// Record cosigning
-		cosignedStatus := "false"
-		if validator.Cosigned {
-			cosignedStatus = "true"
-			cosignedCount++
-		}
+		cosignedStatus := fmt.Sprintf("%t", validator.Cosigned)
 		m.cosignedViews.WithLabelValues(identity, cosignedStatus).Inc()
-		
-		// Update balance
+		m.log.WithFields(logrus.Fields{
+			"view": viewData.View,
+			"identity": identity,
+			"cosigned_status": cosignedStatus,
+			"action": "record_cosigned_view",
+		}).Debug("Recorded cosigned view with validator identity")
+
+		// Set the balance in metrics
 		var balanceEth float64
 		if validator.Balance != nil {
 			balanceFloat := new(big.Float).SetInt(validator.Balance)
@@ -481,126 +643,13 @@ func (m *Metrics) processView(ctx context.Context, viewData *ConsensusView) erro
 			balanceEth, _ = balanceFloat.Float64()
 		}
 		m.depositBalance.WithLabelValues(identity).Set(balanceEth)
-	}
-	
-	// Log summary every 10 views
-	if viewData.View%10 == 0 {
 		m.log.WithFields(logrus.Fields{
 			"view": viewData.View,
-			"leader": leaderIdentity,
-			"validators": len(viewData.Validators),
-			"cosigned": cosignedCount,
-		}).Info("Processed view summary")
+			"identity": identity,
+			"balance": balanceEth,
+			"action": "record_deposit_balance",
+		}).Debug("Recorded balances with validator identity")
 	}
-	
-	// Update state
-	m.state.LastProcessedView = viewData.View
 	
 	return nil
-}
-
-// findLeaderIdentity finds the leader identity by matching against validators
-func (m *Metrics) findLeaderIdentity(leader []byte, validators []Validator) string {
-	if len(leader) == 0 || string(leader) == "no-leader" {
-		m.log.WithFields(logrus.Fields{
-			"leader_string": string(leader),
-			"leader_length": len(leader),
-		}).Debug("Leader is empty or no-leader")
-		return "no-leader"
-	}
-	
-	// Check if leader is the metadata/placeholder (mostly zeros with some data at the end)
-	// If so, return a proper validator identity instead
-	leaderHex := fmt.Sprintf("%x", leader)
-	if len(leaderHex) >= 32 && leaderHex[:32] == "00000000000000000000000000000000" {
-		// This is likely metadata, find a real validator to use as leader
-		for _, validator := range validators {
-			validatorHex := fmt.Sprintf("%x", validator.BlsPubKey)
-			// Skip the metadata validator (index 0)
-			if len(validatorHex) >= 32 && validatorHex[:32] != "00000000000000000000000000000000" {
-				identity := fmt.Sprintf("0x%x", validator.BlsPubKey)
-				m.log.WithFields(logrus.Fields{
-					"original_leader": fmt.Sprintf("0x%x", leader),
-					"replaced_with": identity,
-					"reason": "leader_was_metadata_placeholder",
-				}).Debug("Replaced metadata leader with real validator")
-				return identity
-			}
-		}
-	}
-	
-	// Debug what we're trying to match
-	m.log.WithFields(logrus.Fields{
-		"leader_hex": leaderHex,
-		"leader_length": len(leader),
-		"validator_count": len(validators),
-	}).Debug("Trying to match leader")
-	
-	// Try exact match first
-	for i, validator := range validators {
-		validatorHex := fmt.Sprintf("%x", validator.BlsPubKey)
-		if validatorHex == leaderHex {
-			identity := fmt.Sprintf("0x%x", validator.BlsPubKey)
-			m.log.WithFields(logrus.Fields{
-				"match_type": "exact",
-				"validator_index": i,
-				"leader_identity": identity,
-			}).Debug("Found leader by exact match")
-			return identity
-		}
-	}
-	
-	// Try prefix match if leader is shorter
-	if len(leader) < 48 {
-		for i, validator := range validators {
-			validatorHex := fmt.Sprintf("%x", validator.BlsPubKey)
-			if strings.HasPrefix(validatorHex, leaderHex) {
-				identity := fmt.Sprintf("0x%x", validator.BlsPubKey)
-				m.log.WithFields(logrus.Fields{
-					"match_type": "prefix",
-					"validator_index": i,
-					"leader_identity": identity,
-					"leader_bytes": len(leader),
-				}).Debug("Found leader by prefix match")
-				return identity
-			}
-		}
-	}
-	
-	// Try matching last N bytes if leader is shorter
-	if len(leader) < 48 {
-		for i, validator := range validators {
-			if len(validator.BlsPubKey) >= len(leader) {
-				startIdx := len(validator.BlsPubKey) - len(leader)
-				validatorSuffix := fmt.Sprintf("%x", validator.BlsPubKey[startIdx:])
-				if validatorSuffix == leaderHex {
-					identity := fmt.Sprintf("0x%x", validator.BlsPubKey)
-					m.log.WithFields(logrus.Fields{
-						"match_type": "suffix",
-						"validator_index": i,
-						"leader_identity": identity,
-						"leader_bytes": len(leader),
-					}).Debug("Found leader by suffix match")
-					return identity
-				}
-			}
-		}
-	}
-	
-	// Return leader as hex if no match found
-	identity := fmt.Sprintf("0x%x", leader)
-	m.log.WithFields(logrus.Fields{
-		"leader_identity": identity,
-		"reason": "no_match_found",
-	}).Debug("Could not match leader to any validator")
-	
-	return identity
-}
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

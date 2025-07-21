@@ -99,16 +99,16 @@ func (e *exporter) Init(ctx context.Context) error {
 
 	// Initialize Zilliqa exporter
 	if e.config.Zilliqa.Enabled {
-		e.log.Info("Initializing Zilliqa...")
+		e.log.Info("Initializing Zilliqa metrics...")
 
 		zilliqaConfig := &zilliqa.Config{
 			Enabled:         e.config.Zilliqa.Enabled,
 			RPCURL:          e.config.Zilliqa.RPCURL,
 			DepositContract: e.config.GetZilliqaDepositContract(),
-			CheckInterval:   e.config.Zilliqa.CheckInterval,
+			Interval:   		 e.config.Zilliqa.Interval,
 		}
 
-		zilliqaExporter, err := zilliqa.NewFromConfig(zilliqaConfig, e.log.WithField("exporter", "zilliqa"))
+		zilliqaExporter, err := zilliqa.NewFromConfig(zilliqaConfig, e.log.WithField("exporter", "zilliqa"), e.config.Debug)
 		if err != nil {
 			return err
 		}

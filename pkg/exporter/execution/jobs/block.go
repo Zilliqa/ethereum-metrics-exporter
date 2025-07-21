@@ -174,7 +174,7 @@ func (b *BlockMetrics) Start(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Second * 15):
+		case <-time.After(time.Second * 30):
 			b.tick(ctx)
 		}
 	}

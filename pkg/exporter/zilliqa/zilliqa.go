@@ -11,7 +11,7 @@ import (
 )
 
 // New creates a new Zilliqa metrics collector
-func New(rpcURL string, config *Config, log logrus.FieldLogger) (*Metrics, error) {
+func New(rpcURL string, config *Config, log logrus.FieldLogger, debug bool) (*Metrics, error) {
 	if config == nil {
 		config = DefaultConfig()
 		config.RPCURL = rpcURL
@@ -30,13 +30,13 @@ func New(rpcURL string, config *Config, log logrus.FieldLogger) (*Metrics, error
 	}
 	
 	// Create metrics collector
-	metrics := NewMetrics(client, log, config)
+	metrics := NewMetrics(client, log, config, debug)
 	
 	return metrics, nil
 }
 
 // NewFromConfig creates a new Zilliqa metrics collector from configuration
-func NewFromConfig(config *Config, log logrus.FieldLogger) (*Metrics, error) {
+func NewFromConfig(config *Config, log logrus.FieldLogger, debug bool) (*Metrics, error) {
 	if config == nil {
 		return nil, fmt.Errorf("configuration cannot be nil")
 	}
@@ -45,7 +45,7 @@ func NewFromConfig(config *Config, log logrus.FieldLogger) (*Metrics, error) {
 		return nil, fmt.Errorf("zilliqa metrics are disabled")
 	}
 	
-	return New(config.RPCURL, config, log)
+	return New(config.RPCURL, config, log, debug)
 }
 
 // StartMetricsCollection starts the metrics collection process

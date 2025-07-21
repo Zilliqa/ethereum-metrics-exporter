@@ -19,6 +19,8 @@ type Config struct {
 	Pair PairConfig `yaml:"pair"`
 	// Zilliqa determines if the Zilliqa metrics should be exported.
 	Zilliqa ZilliqaConfig `yaml:"zilliqa"`
+	// Debug enables debug mode for the exporter.
+	Debug bool `yaml:"debug"`
 }
 
 // ConsensusNode represents a single ethereum consensus client.
@@ -56,10 +58,10 @@ type PairConfig struct {
 
 // ZilliqaConfig represents Zilliqa configuration
 type ZilliqaConfig struct {
-	Enabled         bool          `yaml:"enabled"`
-	RPCURL          string        `yaml:"rpcUrl"`
-	DepositContract string        `yaml:"depositContract"`
-	CheckInterval   time.Duration `yaml:"checkInterval"`
+	Enabled         bool           `yaml:"enabled"`
+	RPCURL          string         `yaml:"rpcUrl"`
+	DepositContract string         `yaml:"depositContract"`
+	Interval   			human.Duration `yaml:"interval"`
 }
 
 // DefaultConfig represents a sane-default configuration.
@@ -95,8 +97,11 @@ func DefaultConfig() *Config {
 			Enabled:         false,
 			RPCURL:          "",
 			DepositContract: "0x00000000005a494c4445504f53495450524f5859",
-			CheckInterval:   10 * time.Second,
+			Interval: human.Duration{
+				Duration: 10 * time.Second,
+			},
 		},
+		Debug: false,
 	}
 }
 
