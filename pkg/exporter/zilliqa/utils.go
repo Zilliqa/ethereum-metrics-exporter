@@ -179,8 +179,8 @@ func ValidateConfig(config *Config) error {
 		return fmt.Errorf("rpcUrl is required when zilliqa is enabled")
 	}
 	
-	if config.CheckInterval == 0 {
-		return fmt.Errorf("checkInterval must be greater than 0")
+	if config.Interval.Duration == 0 {
+		return fmt.Errorf("interval must be greater than 0")
 	}
 	
 	if config.DepositContract == (common.Address{}) {

@@ -34,6 +34,7 @@ Flags:
   -h, --help                            help for ethereum-metrics-exporter
       --metrics-port int                Port to serve Prometheus metrics on (default 9090)
       --monitored-directories strings   (optional) directories to monitor for disk usage
+  -d, --debug bool                      Enable debug mode (default is false)
   -t, --toggle                          Help message for toggle
 ```
 ## Getting Started
@@ -41,41 +42,25 @@ Flags:
 ### Grafana
 * [Single instance dashboard](https://grafana.com/grafana/dashboards/16277)
 
-### Docker
-Available as a docker image at `ethpandaops/ethereum-metrics-exporter`
-
-#### Images
-- `latest` - distroless, multiarch
-- `debian-latest` - debian, multiarch
-- `$version` - distroless, multiarch, pinned to a release (i.e. 0.4.0)
-- `$version-debian` - debian, multiarch, pinned to a release (i.e. 0.4.0-debian)
-
 **Quick start**
 ```
-docker run -d -it --name ethereum-metrics-exporter -p 9090:9090 -it ethpandaops/ethereum-metrics-exporter --consensus-url=http://localhost:5052 --execution-url=http://localhost:8545
+docker run -d -it --name ethereum-metrics-exporter -p 9090:9090 -it zilliqa/ethereum-metrics-exporter --consensus-url=http://localhost:5052 --execution-url=http://localhost:8545
 ````
 **With a config file**
 ```
-docker run -d -it --name ethereum-metrics-exporter -v $HOST_DIR_CHANGE_ME/config.yaml:/opt/exporter/config.yaml -p 9090:9090 -it ethpandaops/ethereum-metrics-exporter --config /opt/exporter/config.yaml
+docker run -d -it --name ethereum-metrics-exporter -v $HOST_DIR_CHANGE_ME/config.yaml:/opt/exporter/config.yaml -p 9090:9090 -it zilliqa/ethereum-metrics-exporter --config /opt/exporter/config.yaml
 
-```
-### Kubernetes via Helm
-[Read more](https://github.com/skylenet/ethereum-helm-charts/tree/master/charts/ethereum-metrics-exporter)
-```
-helm repo add ethereum-helm-charts https://ethpandaops.github.io/ethereum-helm-charts
-
-helm install ethereum-metrics-exporter ethereum-helm-charts/ethereum-metrics-exporter -f your_values.yaml
 ```
 
 ### Standalone
 **Downloading a release**
-Available [here](https://github.com/ethpandaops/ethereum-metrics-exporter/releases)
+Available [here](https://github.com/zilliqa/ethereum-metrics-exporter/releases)
 
 **Building yourself (requires Go)**
 
 1. Clone the repo
    ```sh
-   go get github.com/ethpandaops/ethereum-metrics-exporter
+   go get github.com/zilliqa/ethereum-metrics-exporter
    ```
 2. Change directories
    ```sh
@@ -104,7 +89,3 @@ Contributions are greatly appreciated! Pull requests will be reviewed and merged
 4. Push to the branch:
     -`git push origin feat/new-metric-profit`
 5. Open a pull request
-
-## Contact
-
-Sam - [@samcmau](https://twitter.com/samcmau)

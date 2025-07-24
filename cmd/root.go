@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ethpandaops/beacon/pkg/human"
 	"github.com/ethpandaops/ethereum-metrics-exporter/pkg/exporter"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -37,8 +38,9 @@ var (
 	executionModules     []string
 	diskUsageInterval    string
 	// Zilliqa flags
-	zilliqaRPCURL      string
-	zilliqaCheckInterval string
+	zilliqaRPCURL        string
+	zilliqaInterval      string
+	debug                bool
 )
 
 const (
@@ -62,9 +64,9 @@ func init() {
 	rootCmd.PersistentFlags().StringSliceVarP(&monitoredDirectories, "monitored-directories", "", []string{}, "(optional) directories to monitor for disk usage")
 	rootCmd.PersistentFlags().StringSliceVarP(&executionModules, "execution-modules", "", []string{}, "(optional) execution modules that are enabled on the node")
 	rootCmd.PersistentFlags().StringVar(&diskUsageInterval, "disk-usage-interval", "", "(optional) interval for disk usage metrics collection (e.g. 1h, 5m, 30s)")
-	// Zilliqa flags
 	rootCmd.PersistentFlags().StringVar(&zilliqaRPCURL, "zilliqa-rpc-url", "", "(optional) URL to the Zilliqa RPC node")
-	rootCmd.PersistentFlags().StringVar(&zilliqaCheckInterval, "zilliqa-check-interval", "10s", "(optional) interval for Zilliqa metrics collection")
+	rootCmd.PersistentFlags().StringVar(&zilliqaInterval, "zilliqa-interval", "", "(optional) interval for Zilliqa metrics collection")
+	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "d", false, "Enable debug mode (default is false)")
 	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 }
 
@@ -129,19 +131,21 @@ func initCommon() {
 		config.DiskUsage.Enabled = true
 	}
 
-	// Zilliqa configuration
+	// Zilliqa metrics configuration
 	if zilliqaRPCURL != "" {
 		config.Zilliqa.Enabled = true
 		config.Zilliqa.RPCURL = zilliqaRPCURL
 	}
 
-	if zilliqaCheckInterval != "" {
-		duration, err := time.ParseDuration(zilliqaCheckInterval)
+	if zilliqaInterval != "" {
+		duration, err := time.ParseDuration(zilliqaInterval)
 		if err != nil {
-			logr.WithError(err).Fatalf("Invalid Zilliqa check interval format: %s", zilliqaCheckInterval)
+			logr.WithError(err).Fatalf("Invalid Zilliqa check interval format: %s", zilliqaInterval)
 		}
-		config.Zilliqa.CheckInterval = duration
+		config.Zilliqa.Interval = human.Duration{Duration: duration}
 	}
+
+	config.Debug = debug
 
 	export = exporter.NewExporter(log, config)
 
